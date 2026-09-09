@@ -376,6 +376,17 @@ bool FMonolithHttpServer::HandleHealthCheck(const FHttpServerRequest& Request, c
 
 TSharedPtr<FJsonObject> FMonolithHttpServer::ProcessJsonRpcRequest(const TSharedPtr<FJsonObject>& Request)
 {
+	// Re-entrancy guard: a blocking tool call (e.g. a map load) pumps FTSTicker via slow-task
+	// dialogs, which ticks this HTTP server and can dispatch a second request INSIDE the first.
+	// Processing re-entrantly crashes the editor - answer busy instead.
+	static bool bProcessingRequest = false;
+	if (bProcessingRequest)
+	{
+		return FMonolithJsonUtils::ErrorResponse(nullptr, FMonolithJsonUtils::ErrInvalidRequest,
+			TEXT("Server busy: another request is still executing on the game thread. Retry when it completes."));
+	}
+	TGuardValue<bool> ProcessingGuard(bProcessingRequest, true);
+
 	if (!Request.IsValid())
 	{
 		return FMonolithJsonUtils::ErrorResponse(nullptr, FMonolithJsonUtils::ErrInvalidRequest, TEXT("Invalid request object — must be a JSON object with jsonrpc, method, and id fields."));
