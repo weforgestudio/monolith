@@ -376,13 +376,24 @@ bool FMonolithHttpServer::HandleHealthCheck(const FHttpServerRequest& Request, c
 
 TSharedPtr<FJsonObject> FMonolithHttpServer::ProcessJsonRpcRequest(const TSharedPtr<FJsonObject>& Request)
 {
-	// Re-entrancy guard: a blocking tool call (e.g. a map load) pumps FTSTicker via slow-task
-	// dialogs, which ticks this HTTP server and can dispatch a second request INSIDE the first.
-	// Processing re-entrantly crashes the editor - answer busy instead.
+	// Re-entrancy tripwire (Weforge fork). The only caller is HandlePostMcp, which runs on the game
+	// thread inside the core FTSTicker (FHttpServerModule::Tick -> FHttpListener::Tick). A second
+	// request can land here only if something inside a running tool call ticks the HTTP listener
+	// directly; a nested core FTSTicker::Tick asserts in Ticker.cpp before it gets this far. Never
+	// dispatch inside another dispatch: answer a busy error that carries the caller's id (an id-less
+	// error cannot be matched by an MCP client) and log it, so a firing is visible. Game thread only,
+	// hence a plain static bool.
 	static bool bProcessingRequest = false;
 	if (bProcessingRequest)
 	{
-		return FMonolithJsonUtils::ErrorResponse(nullptr, FMonolithJsonUtils::ErrInvalidRequest,
+		UE_LOG(LogMonolith, Warning, TEXT("Re-entrant JSON-RPC request rejected: another request is still executing on the game thread."));
+		const TSharedPtr<FJsonValue> BusyId = Request.IsValid() ? Request->TryGetField(TEXT("id")) : TSharedPtr<FJsonValue>();
+		if (Request.IsValid() && (!BusyId.IsValid() || BusyId->IsNull()))
+		{
+			return nullptr; // Notification: JSON-RPC forbids a response.
+		}
+		constexpr int32 ErrServerBusy = -32000; // JSON-RPC implementation-defined server error
+		return FMonolithJsonUtils::ErrorResponse(BusyId, ErrServerBusy,
 			TEXT("Server busy: another request is still executing on the game thread. Retry when it completes."));
 	}
 	TGuardValue<bool> ProcessingGuard(bProcessingRequest, true);
